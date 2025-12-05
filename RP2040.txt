@@ -1,0 +1,422 @@
+/* ================== BIBLIOTECAS ================== */
+#include <FreeRTOS.h>
+#include <task.h>
+#include <semphr.h>
+#include <queue.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <pico/stdlib.h>
+#include <pico/multicore.h>
+#include <math.h>
+#include <hardware/uart.h>
+
+/* ================== DEFINICIONES ================== */
+// UART
+#define UART_ID uart0
+#define BAUD_RATE 115200
+#define UART_TX_PIN 0
+#define UART_RX_PIN 1
+
+// Rango de términos
+#define MINIMO_TERMINOS 10
+#define MAXIMO_TERMINOS 1000
+
+// Rango de valores de X 
+#define VALOR_X_MINIMO 0.0
+#define VALOR_X_MAXIMO 10.0
+
+// Número de puntos para calcular
+#define MINIMO_PUNTOS 10
+#define MAXIMO_PUNTOS 300
+
+// Delay entre envío de puntos (ms) para evitar saturación
+#define DELAY_ENTRE_PUNTOS_MS 20
+
+/* ================== ESTRUCTURA DE TRABAJO ================== */
+typedef struct {
+    uint32_t primerTermino;
+    uint32_t ultimoTermino;
+    double valorX;
+    double resultadoParcial;
+} trabajoDeCore;
+
+/* ================== VARIABLES GLOBALES ================== */
+SemaphoreHandle_t semaforoCore1Listo;
+trabajoDeCore trabajoCore1;
+SemaphoreHandle_t uart_mutex;
+
+/* ================== PROTOTIPOS ================== */
+static void ejecutarTareaPrincipal(void *param);
+static void ejecutarTareaCore1(void);
+static double calcularSincParaRango(uint32_t primerTermino, uint32_t ultimoTermino, double valorX);
+static double calcularSincConNumeroDeTerminos(uint32_t numeroDeTerminos, double valorX);
+static bool leerNumeroEnteroDesdeTeclado(uint32_t* numero);
+static double calcularFactorial(uint32_t n);
+static void setup_uart(void);
+static uint32_t get_time_ms(void);
+static void enviar_uart(const char *mensaje);
+static void tareaHandshake(void *param);
+static void procesar_sinc_request(uint32_t numeroDeTerminos, uint32_t numeroDePuntos);
+
+/* ================== FUNCIONES ================== */
+
+// Inicialización UART
+static void setup_uart(void) {
+    uart_init(UART_ID, BAUD_RATE);
+    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+    uart_set_fifo_enabled(UART_ID, true);
+}
+
+// Envío UART con mutex
+static void enviar_uart(const char *mensaje) {
+    xSemaphoreTake(uart_mutex, portMAX_DELAY);
+    uart_puts(UART_ID, mensaje);
+    xSemaphoreGive(uart_mutex);
+}
+
+// Tiempo en ms desde boot
+static uint32_t get_time_ms(void) {
+    return to_ms_since_boot(get_absolute_time());
+}
+
+// Factorial
+static double calcularFactorial(uint32_t n) {
+    double resultado = 1.0;
+    for (uint32_t i = 2; i <= n; ++i) resultado *= i;
+    return resultado;
+}
+
+// Core1 calcula su parte
+static void ejecutarTareaCore1(void) {
+    trabajoCore1.resultadoParcial = calcularSincParaRango(
+        trabajoCore1.primerTermino,
+        trabajoCore1.ultimoTermino,
+        trabajoCore1.valorX
+    );
+    xSemaphoreGive(semaforoCore1Listo);
+}
+
+// Serie sinc por rango
+static double calcularSincParaRango(uint32_t primerTermino, uint32_t ultimoTermino, double valorX) {
+    if (valorX == 0.0) return (primerTermino == 0 ? 1.0 : 0.0);
+
+    double suma = 0.0;
+    for (uint32_t k = primerTermino; k < ultimoTermino; ++k) {
+        double valorXAlCuadrado = pow(valorX, 2*k);
+        double factorialDeTermino = calcularFactorial(2*k + 1);
+
+        if (!isfinite(valorXAlCuadrado) || !isfinite(factorialDeTermino)) continue;
+        if (fabs(valorXAlCuadrado / factorialDeTermino) < 1e-300) continue;
+        if (fabs(valorXAlCuadrado / factorialDeTermino) > 1e+300) continue;
+
+        double termino = pow(-1.0, k) * valorXAlCuadrado / factorialDeTermino;
+        suma += termino;
+    }
+    return suma;
+}
+
+// Serie sinc completa
+static double calcularSincConNumeroDeTerminos(uint32_t numeroDeTerminos, double valorX) {
+    return calcularSincParaRango(0, numeroDeTerminos, valorX);
+}
+
+// Leer número desde teclado
+static bool leerNumeroEnteroDesdeTeclado(uint32_t* numero) {
+    char buffer[16];
+    int indice = 0;
+    while (1) {
+        int c = getchar();
+        if (c < 0) continue;
+        if (c == '\r' || c == '\n') {
+            putchar('\n');
+            if (indice == 0) return false;
+            buffer[indice] = 0;
+            *numero = atoi(buffer);
+            return true;
+        }
+        if ((c == 127 || c == 8) && indice > 0) { indice--; putchar('\b'); putchar(' '); putchar('\b'); continue; }
+        if (c >= '0' && c <= '9') { if (indice < 15) buffer[indice++] = c; putchar(c); }
+    }
+}
+
+// ================== TAREA HANDSHAKE ==================
+static void tareaHandshake(void *param) {
+    char buffer[64];
+    while (1) {
+        int idx = 0;
+        // leer línea completa
+        while (1) {
+            int c = uart_getc(UART_ID);
+            if (c == PICO_ERROR_TIMEOUT) continue;
+            if (c == '\n' || c == '\r') {
+                if (idx == 0) break;
+                buffer[idx] = 0;
+                break;
+            }
+            if (idx < (int)sizeof(buffer)-1) buffer[idx++] = (char)c;
+        }
+        if (idx > 0) {
+            if (strcmp(buffer, "PING") == 0) {
+                uart_puts(UART_ID, "PONG\n");
+                printf("Handshake PONG enviado\n");
+            } else if (strncmp(buffer, "sinc:", 5) == 0) {
+                // parse sinc:n,p
+                uint32_t n = 0, p = 0;
+                char *ptr = buffer + 5;
+                char *comma = strchr(ptr, ',');
+                if (comma) {
+                    *comma = 0;
+                    n = (uint32_t)atoi(ptr);
+                    p = (uint32_t)atoi(comma + 1);
+                } else {
+                    printf("Formato sinc invalido: %s\n", buffer);
+                    continue;
+                }
+                // confirmar inicio al ESP
+                uart_puts(UART_ID, "INICIA CALCULO\n");
+                printf("Recibido sinc: n=%u p=%u -> INICIA CALCULO enviado\n", n, p);
+
+                // procesar petición
+                procesar_sinc_request(n, p);
+
+                // Al finalizar, enviar TERMINADO
+                uart_puts(UART_ID, "TERMINADO\n");
+                printf("Calculo terminado. TERMINADO enviado\n");
+            } else {
+                printf("Linea UART desconocida: '%s'\n", buffer);
+            }
+        }
+    }
+}
+
+/* Función que hace el cálculo y envía los puntos uno por uno */
+static void procesar_sinc_request(uint32_t numeroDeTerminos, uint32_t numeroDePuntos) {
+    if (numeroDeTerminos < MINIMO_TERMINOS) numeroDeTerminos = MINIMO_TERMINOS;
+    if (numeroDeTerminos > MAXIMO_TERMINOS) numeroDeTerminos = MAXIMO_TERMINOS;
+    if (numeroDePuntos < MINIMO_PUNTOS) numeroDePuntos = MINIMO_PUNTOS;
+    if (numeroDePuntos > MAXIMO_PUNTOS) numeroDePuntos = MAXIMO_PUNTOS;
+
+    double distanciaEntrePuntos = (VALOR_X_MAXIMO - VALOR_X_MINIMO) / (numeroDePuntos - 1);
+
+    // ===== UN SOLO NÚCLEO =====
+    TickType_t tiempoInicio = xTaskGetTickCount();
+    double *resultados_uno = (double *)malloc(sizeof(double) * numeroDePuntos);
+    if (resultados_uno == NULL) {
+        printf("Malloc failed for resultados_uno\n");
+        return;
+    }
+    for (uint32_t i = 0; i < numeroDePuntos; i++) {
+        double x = VALOR_X_MINIMO + distanciaEntrePuntos * i;
+        resultados_uno[i] = calcularSincConNumeroDeTerminos(numeroDeTerminos, x);
+    }
+    TickType_t tiempoFin = xTaskGetTickCount();
+    uint32_t tiempoUnNucleo = (tiempoFin - tiempoInicio) * (1000 / configTICK_RATE_HZ);
+
+    // ===== DOS NÚCLEOS =====
+    TickType_t tiempoInicioDos = xTaskGetTickCount();
+    double *resultados_dos = (double *)malloc(sizeof(double) * numeroDePuntos);
+    if (resultados_dos == NULL) {
+        printf("Malloc failed for resultados_dos\n");
+        free(resultados_uno);
+        return;
+    }
+
+    for (uint32_t i = 0; i < numeroDePuntos; i++) {
+        double x = VALOR_X_MINIMO + distanciaEntrePuntos * i;
+        if (x == 0.0) { resultados_dos[i] = 1.0; continue; }
+
+        uint32_t mitadTerminos = numeroDeTerminos / 2;
+        trabajoCore1.primerTermino = mitadTerminos;
+        trabajoCore1.ultimoTermino = numeroDeTerminos;
+        trabajoCore1.valorX = x;
+
+        semaforoCore1Listo = xSemaphoreCreateBinary();
+        multicore_launch_core1(ejecutarTareaCore1);
+
+        double resultadoPrimeraMitad = calcularSincParaRango(0, mitadTerminos, x);
+
+        xSemaphoreTake(semaforoCore1Listo, portMAX_DELAY);
+        resultados_dos[i] = resultadoPrimeraMitad + trabajoCore1.resultadoParcial;
+
+        multicore_reset_core1();
+        vSemaphoreDelete(semaforoCore1Listo);
+    }
+
+    TickType_t tiempoFinDos = xTaskGetTickCount();
+    uint32_t tiempoDosNucleos = (tiempoFinDos - tiempoInicioDos) * (1000 / configTICK_RATE_HZ);
+
+    // Enviar tiempos primero
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "T1:%u\n", tiempoUnNucleo);
+        uart_puts(UART_ID, buf);
+        snprintf(buf, sizeof(buf), "T2:%u\n", tiempoDosNucleos);
+        uart_puts(UART_ID, buf);
+    }
+
+    // Ahora enviar todos los puntos calculados
+    // Formato: PUNTO:x,y1,y2
+    printf("Enviando %u puntos al ESP32...\n", numeroDePuntos);
+    for (uint32_t i = 0; i < numeroDePuntos; i++) {
+        char buf[256];
+        double x = VALOR_X_MINIMO + distanciaEntrePuntos * i;
+        
+        // Formatear con suficiente precisión
+        snprintf(buf, sizeof(buf), "PUNTO:%.12f,%.12e,%.12e\n", 
+                 x, resultados_uno[i], resultados_dos[i]);
+        
+        // Enviar por UART con mutex
+        xSemaphoreTake(uart_mutex, portMAX_DELAY);
+        uart_puts(UART_ID, buf);
+        xSemaphoreGive(uart_mutex);
+        
+        // Pequeño delay para no saturar el ESP32
+        vTaskDelay(pdMS_TO_TICKS(DELAY_ENTRE_PUNTOS_MS));
+        
+        // Log cada 10 puntos
+        if ((i + 1) % 10 == 0 || i == numeroDePuntos - 1) {
+            printf("Enviados %u/%u puntos\n", i + 1, numeroDePuntos);
+        }
+    }
+
+    // Log interno
+    int diferencia = (int)(tiempoUnNucleo - tiempoDosNucleos);
+    float porcentaje = (tiempoUnNucleo - tiempoDosNucleos) * 100.0 / (tiempoUnNucleo > 0 ? tiempoUnNucleo : 1);
+    printf("=== RESUMEN INTERNO ===\n");
+    printf("Tiempo un nucleo: %u ms\n", tiempoUnNucleo);
+    printf("Tiempo dos nucleos: %u ms\n", tiempoDosNucleos);
+    printf("Diferencia: %d ms (%+.2f%%)\n", diferencia, porcentaje);
+    printf("Puntos enviados: %u\n", numeroDePuntos);
+    printf("=======================\n");
+
+    // liberar memoria
+    free(resultados_uno);
+    free(resultados_dos);
+}
+
+/* ================== TAREA PRINCIPAL ================== */
+static void ejecutarTareaPrincipal(void *param) {
+    uint32_t numeroDeTerminos, numeroDePuntos;
+    char mensaje[256];
+
+    while (true) {
+        // Leer términos
+        while (1) {
+            printf("\nIngresa el numero de terminos [%u - %u]: ", MINIMO_TERMINOS, MAXIMO_TERMINOS);
+            if (!leerNumeroEnteroDesdeTeclado(&numeroDeTerminos)) continue;
+            if (numeroDeTerminos >= MINIMO_TERMINOS && numeroDeTerminos <= MAXIMO_TERMINOS) break;
+            printf("Numero incorrecto\n");
+        }
+
+        // Leer puntos
+        while (1) {
+            printf("Ingresa el numero de puntos [%d - %d]: ", MINIMO_PUNTOS, MAXIMO_PUNTOS);
+            if (!leerNumeroEnteroDesdeTeclado(&numeroDePuntos)) continue;
+            if (numeroDePuntos >= MINIMO_PUNTOS && numeroDePuntos <= MAXIMO_PUNTOS) break;
+            printf("Numero incorrecto\n");
+        }
+
+        double distanciaEntrePuntos = (VALOR_X_MAXIMO - VALOR_X_MINIMO) / (numeroDePuntos - 1);
+
+        /* ===== UN SOLO NÚCLEO ===== */
+        TickType_t tiempoInicio = xTaskGetTickCount();
+        double resultados_uno[numeroDePuntos];
+
+        for (uint32_t i = 0; i < numeroDePuntos; i++) {
+            double x = VALOR_X_MINIMO + distanciaEntrePuntos * i;
+            resultados_uno[i] = calcularSincConNumeroDeTerminos(numeroDeTerminos, x);
+        }
+
+        TickType_t tiempoFin = xTaskGetTickCount();
+        uint32_t tiempoUnNucleo = (tiempoFin - tiempoInicio) * (1000 / configTICK_RATE_HZ);
+
+        snprintf(mensaje, sizeof(mensaje), "=== RESULTADOS UN NUCLEO ===\n");
+        enviar_uart(mensaje);
+        for (uint32_t i = 0; i < numeroDePuntos; i++) {
+            double x = VALOR_X_MINIMO + distanciaEntrePuntos * i;
+            snprintf(mensaje, sizeof(mensaje), "x=%.6f y=%.12f\n", x, resultados_uno[i]);
+            enviar_uart(mensaje);
+        }
+        snprintf(mensaje, sizeof(mensaje), "Tiempo total un nucleo: %u ms\n", tiempoUnNucleo);
+        enviar_uart(mensaje);
+
+        /* ===== DOS NÚCLEOS ===== */
+        TickType_t tiempoInicioDos = xTaskGetTickCount();
+        double resultados_dos[numeroDePuntos];
+
+        for (uint32_t i = 0; i < numeroDePuntos; i++) {
+            double x = VALOR_X_MINIMO + distanciaEntrePuntos * i;
+            if (x == 0.0) { resultados_dos[i] = 1.0; continue; }
+
+            uint32_t mitadTerminos = numeroDeTerminos / 2;
+            trabajoCore1.primerTermino = mitadTerminos;
+            trabajoCore1.ultimoTermino = numeroDeTerminos;
+            trabajoCore1.valorX = x;
+
+            semaforoCore1Listo = xSemaphoreCreateBinary();
+            multicore_launch_core1(ejecutarTareaCore1);
+
+            double resultadoPrimeraMitad = calcularSincParaRango(0, mitadTerminos, x);
+
+            xSemaphoreTake(semaforoCore1Listo, portMAX_DELAY);
+            resultados_dos[i] = resultadoPrimeraMitad + trabajoCore1.resultadoParcial;
+
+            multicore_reset_core1();
+            vSemaphoreDelete(semaforoCore1Listo);
+        }
+
+        TickType_t tiempoFinDos = xTaskGetTickCount();
+        uint32_t tiempoDosNucleos = (tiempoFinDos - tiempoInicioDos) * (1000 / configTICK_RATE_HZ);
+
+        snprintf(mensaje, sizeof(mensaje), "=== RESULTADOS DOS NUCLEOS ===\n");
+        enviar_uart(mensaje);
+        for (uint32_t i = 0; i < numeroDePuntos; i++) {
+            double x = VALOR_X_MINIMO + distanciaEntrePuntos * i;
+            snprintf(mensaje, sizeof(mensaje), "x=%.6f y=%.12f\n", x, resultados_dos[i]);
+            enviar_uart(mensaje);
+        }
+        snprintf(mensaje, sizeof(mensaje), "Tiempo total dos nucleos: %u ms\n", tiempoDosNucleos);
+        enviar_uart(mensaje);
+
+        // Comparativa
+        int diferencia = (int)(tiempoUnNucleo - tiempoDosNucleos);
+        float porcentaje = (tiempoUnNucleo - tiempoDosNucleos) * 100.0 / (tiempoUnNucleo > 0 ? tiempoUnNucleo : 1.0);
+        snprintf(mensaje, sizeof(mensaje), "=== COMPARATIVA ===\nUn nucleo: %u ms\nDos nucleos: %u ms\nDiferencia: %d ms (%+.2f%%)\n",
+                 tiempoUnNucleo, tiempoDosNucleos, diferencia, porcentaje);
+        enviar_uart(mensaje);
+    }
+}
+
+/* ================== HOOKS ================== */
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *nombreTarea) {
+    printf("ERROR: Stack overflow en la tarea %s\n", nombreTarea);
+    while (1) { }
+}
+
+void vApplicationTickHook(void) { }
+
+void vApplicationMallocFailedHook(void) {
+    printf("ERROR: Fallo de malloc – no hay suficiente memoria\n");
+    while (1) { }
+}
+
+/* ================== MAIN ================== */
+int main(void) {
+    stdio_init_all();
+    setup_uart();
+    uart_mutex = xSemaphoreCreateMutex();
+
+    printf("\f=== CALCULO MULTIPUNTO SINC EN RP2040 (DOS NUCLEOS) ===\n");
+
+    // Lanzar tarea de handshake primero
+    xTaskCreate(tareaHandshake, "Handshake", 2048, NULL, 2, NULL);
+
+    // Lanzar tarea principal
+    xTaskCreate(ejecutarTareaPrincipal, "TareaPrincipal", 8192, NULL, 1, NULL);
+
+    vTaskStartScheduler();
+
+    while (true);
+}
