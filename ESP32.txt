@@ -1,0 +1,791 @@
+import machine
+import network
+import utime
+import usocket
+import _thread
+import ujson
+
+# ========== Configuración / Globales ==========
+ID_UART = 2
+VEL_UART = 115200
+PIN_TX = 17
+PIN_RX = 16
+
+wifi = None
+servidor_web = None
+
+puerto_serial = None
+bloqueo_serial = _thread.allocate_lock()
+
+# Buffer de líneas que llegan desde el RP2040
+lineas_entrantes = []
+bloqueo_lineas = _thread.allocate_lock()
+
+# Buffer para guardar los puntos calculados
+puntos_calculados = []
+bloqueo_puntos = _thread.allocate_lock()
+
+DEBUG = True   # True para depuración en REPL
+MAX_LINEAS_DEBUG = 200
+
+# =============================================
+# Inicialización
+# =============================================
+def configurarUART():
+    global puerto_serial
+    puerto_serial = machine.UART(ID_UART, baudrate=VEL_UART, tx=PIN_TX, rx=PIN_RX, timeout=10, timeout_char=10)
+    print("UART inicializada")
+
+def configurarWiFi():
+    global wifi
+    wifi = network.WLAN(network.AP_IF)
+    wifi.active(False)
+    wifi.config(ssid="Sensor", security=network.AUTH_WPA2_PSK, key="12345678")
+    wifi.active(True)
+    wifi.ifconfig(("192.168.1.1", "255.255.255.0", "192.168.1.1", "192.168.1.1"))
+    network.hostname("Sensor")
+    print("WiFi configurada")
+
+def configurarSockets():
+    global servidor_web
+    while not wifi.active():
+        utime.sleep_ms(100)
+    servidor_web = usocket.socket(usocket.AF_INET, usocket.SOCK_STREAM)
+    servidor_web.setsockopt(usocket.SOL_SOCKET, usocket.SO_REUSEADDR, 1)
+    ip = wifi.ifconfig()[0]
+    servidor_web.bind((ip, 80))
+    servidor_web.listen(5)
+    print("Escuchando en", ip, ":80")
+
+# =============================================
+# Handshake (PING -> esperar PONG)
+# =============================================
+def hacer_handshake(intentos=6, tiempo_por_intento_ms=2000):
+    print("Verificando comunicación con RP2040 (PING -> PONG)...")
+    for intento in range(intentos):
+        with bloqueo_serial:
+            puerto_serial.write(b"PING\n")
+        tiempo_inicio = utime.ticks_ms()
+        while utime.ticks_diff(utime.ticks_ms(), tiempo_inicio) < tiempo_por_intento_ms:
+            if puerto_serial.any():
+                raw = puerto_serial.readline()
+                if not raw:
+                    utime.sleep_ms(10)
+                    continue
+                try:
+                    s = raw.decode("utf-8", "ignore").strip()
+                except:
+                    s = str(raw)
+                print("UART recibido:", s)
+                if "PONG" in s:
+                    print("Comunicación con RP2040 OK")
+                    return True
+            utime.sleep_ms(10)
+        print("Reintentando PING...", intento+1)
+    return False
+
+# =============================================
+# Hilo lector: lee UART continuamente y guarda líneas
+# =============================================
+def hilo_lector_uart(_):
+    global lineas_entrantes, puntos_calculados
+    print("Hilo lector UART iniciado")
+    buffer_linea = ""  # Para líneas incompletas
+    
+    while True:
+        try:
+            if puerto_serial.any():
+                # Leer datos disponibles
+                datos = puerto_serial.read(puerto_serial.any())
+                if datos:
+                    try:
+                        texto = datos.decode("utf-8", "ignore")
+                        buffer_linea += texto
+                        
+                        # Procesar líneas completas
+                        while "\n" in buffer_linea:
+                            linea, buffer_linea = buffer_linea.split("\n", 1)
+                            linea = linea.strip()
+                            
+                            if not linea:
+                                continue
+                            
+                            # Procesar líneas de puntos
+                            if linea.startswith("PUNTO:"):
+                                # Formato: PUNTO:index:x,y1,y2
+                                try:
+                                    data = linea[6:]
+                                    if ":" in data:
+                                        idx_str, valores = data.split(":", 1)
+                                        indice = int(idx_str)
+                                        partes = valores.split(",")
+                                    else:
+                                        partes = data.split(",")
+                                        indice = -1
+                                    
+                                    if len(partes) == 3:
+                                        x = float(partes[0])
+                                        y1 = float(partes[1])
+                                        y2 = float(partes[2])
+                                        with bloqueo_puntos:
+                                            puntos_calculados.append({
+                                                "indice": indice,
+                                                "x": x, 
+                                                "y1": y1, 
+                                                "y2": y2
+                                            })
+                                        if DEBUG:
+                                            print("PUNTO guardado: idx={} x={:.4f}".format(indice, x))
+                                except Exception as e:
+                                    print("Error al procesar PUNTO:", e, "Linea:", linea)
+                            
+                            # Guardar línea en buffer general
+                            with bloqueo_lineas:
+                                lineas_entrantes.append(linea)
+                                if len(lineas_entrantes) > 2000:
+                                    lineas_entrantes = lineas_entrantes[-1000:]
+                            
+                            if DEBUG and not linea.startswith("PUNTO:"):
+                                print("LINEA <-", linea)
+                                
+                    except Exception as e:
+                        print("Error decodificando datos:", e)
+        except Exception as e:
+            print("Error hilo lector UART:", e)
+        utime.sleep_ms(10)
+
+# =============================================
+# Esperar tokens
+# =============================================
+def esperar_tokens(tokens_esperados, tiempo_ms=180000):
+    encontrados = {}
+    tiempo_inicio = utime.ticks_ms()
+    while utime.ticks_diff(utime.ticks_ms(), tiempo_inicio) < tiempo_ms:
+        with bloqueo_lineas:
+            for ln in lineas_entrantes:
+                for tok in tokens_esperados:
+                    if tok in ln and tok not in encontrados:
+                        encontrados[tok] = ln
+        todos_encontrados = all(tok in encontrados for tok in tokens_esperados)
+        if todos_encontrados:
+            return encontrados
+        utime.sleep_ms(10)
+    return encontrados
+
+def vaciar_hasta_token(token, tiempo_ms=2000):
+    recopiladas = []
+    tiempo_inicio = utime.ticks_ms()
+    while utime.ticks_diff(utime.ticks_ms(), tiempo_inicio) < tiempo_ms:
+        with bloqueo_lineas:
+            while lineas_entrantes:
+                ln = lineas_entrantes.pop(0)
+                recopiladas.append(ln)
+                if token in ln:
+                    return "\n".join(recopiladas)
+        utime.sleep_ms(10)
+    return "\n".join(recopiladas)
+
+# =============================================
+# Enviar solicitud sinc
+# =============================================
+def solicitar_sinc(n, p, tiempo_ms=180000):
+    # Limpiar buffer de puntos antes de nueva solicitud
+    with bloqueo_puntos:
+        puntos_calculados.clear()
+    
+    req = "sinc:{},{}\n".format(n, p)
+    with bloqueo_serial:
+        puerto_serial.write(req.encode())
+    print("UART =>", req.strip())
+
+    # Esperar tokens
+    esperados = ["INICIA CALCULO", "T1:", "T2:", "TERMINADO"]
+    encontrados = esperar_tokens(esperados, tiempo_ms=tiempo_ms)
+
+    if "TERMINADO" in encontrados:
+        resp = vaciar_hasta_token("TERMINADO", tiempo_ms=2000)
+    else:
+        with bloqueo_lineas:
+            resp = "\n".join(list(lineas_entrantes))
+            lineas_entrantes.clear()
+    return resp
+
+# =============================================
+# Util: obtener parámetros URI
+# =============================================
+def obtener_parametros_uri(solicitud):
+    params = {}
+    qmpos = solicitud.find("?")
+    if qmpos == -1:
+        return params
+    partes = solicitud[qmpos+1:].split("&")
+    for p in partes:
+        subpartes = p.split("=", 1)
+        clave = subpartes[0]
+        valor = subpartes[1] if len(subpartes) > 1 else ""
+        params[clave] = valor
+    return params
+
+# =============================================
+# Handlers del servidor web
+# =============================================
+def atender_sinc(solicitud):
+    params = obtener_parametros_uri(solicitud)
+    if "n" not in params or "p" not in params:
+        return "HTTP/1.1 400 Bad Request\r\n\r\nFaltan parámetros 'n' o 'p'"
+    try:
+        n = int(params["n"])
+        p = int(params["p"])
+    except:
+        return "HTTP/1.1 400 Bad Request\r\n\r\nParámetros inválidos"
+    if n < 10 or n > 1000 or p < 10 or p > 300:
+        return "HTTP/1.1 400 Bad Request\r\n\r\nParámetros fuera de rango"
+
+    resp = solicitar_sinc(n, p, tiempo_ms=180000)
+    if resp is None:
+        return "HTTP/1.1 500 Internal Server Error\r\n\r\nSin respuesta del RP2040"
+    return "HTTP/1.1 200 OK\r\n\r\n" + resp
+
+def atender_valores():
+    """Envía los valores calculados en JSON, ordenados por índice"""
+    with bloqueo_puntos:
+        puntos = list(puntos_calculados)
+    
+    if puntos and "indice" in puntos[0] and puntos[0]["indice"] != -1:
+        puntos.sort(key=lambda p: p["indice"])
+    
+    try:
+        json_data = ujson.dumps(puntos)
+        return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + json_data
+    except Exception as e:
+        print("Error creando JSON:", e)
+        return "HTTP/1.1 500 Internal Server Error\r\n\r\nError creando JSON"
+
+def atender_debug():
+    with bloqueo_lineas:
+        lineas = list(lineas_entrantes[-MAX_LINEAS_DEBUG:])
+    cuerpo = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
+    cuerpo += "Últimas {} líneas del RP2040 (la más reciente al final):\n\n".format(len(lineas))
+    cuerpo += "\n".join(lineas)
+    return cuerpo
+
+def atender_web():
+    try:
+        conexion, addr = servidor_web.accept()
+        conexion.settimeout(3)
+        solicitud = conexion.recv(4096)
+        if not solicitud:
+            conexion.close()
+            return
+        try:
+            sreq = solicitud.decode("utf-8")
+        except:
+            sreq = str(solicitud)
+        
+        if not sreq.startswith("GET "):
+            conexion.send(b"HTTP/1.1 400 Bad Request\r\n\r\nMétodo inválido")
+            conexion.close()
+            return
+        
+        path = sreq[4:sreq.find(" ", 5)]
+        
+        if path.startswith("/sinc") or path.startswith("/?"):
+            payload = atender_sinc(path)
+        elif path == "/getvalues":
+            payload = atender_valores()
+        elif path == "/debug":
+            payload = atender_debug()
+        elif path == "/":
+            payload = webpage()
+        else:
+            payload = "HTTP/1.1 404 Not Found\r\n\r\nNo encontrado"
+        
+        try:
+            conexion.send(payload)
+        except Exception as e:
+            print("Error enviando respuesta:", e)
+        conexion.close()
+    except Exception as e:
+        try:
+            conexion.close()
+        except:
+            pass
+
+def webpage():
+    html = """HTTP/1.1 200 OK
+Content-Type: text/html
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Sinc Calculator</title>
+<style>
+body{background:linear-gradient(180deg,rgba(2,0,36,1)0%,rgba(9,9,121,1)35%,rgba(0,212,255,1)100%);
+font-family:Tahoma,sans-serif;color:#000;margin:0;padding:20px;}
+.container{max-width:1200px;margin:auto;padding:20px;background:#f8f8f8;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.1);}
+h1{text-align:center;margin-top:0;}
+.controls{display:flex;gap:10px;align-items:center;justify-content:center;margin-bottom:10px;flex-wrap:wrap;}
+input{width:6em;padding:6px;border-radius:6px;border:1px solid #ccc;}
+button{padding:8px 12px;border-radius:8px;border:none;background:#008CBA;color:white;cursor:pointer;}
+button:hover{background:#005F7A;}
+table{border-collapse:collapse;width:100%;margin-top:12px;}
+th,td{border:1px solid #aaa;padding:6px;text-align:center;font-size:0.9em;}
+th{background:#eee;font-weight:bold;}
+.status{margin-top:10px;text-align:center;font-weight:bold;}
+.small{font-size:0.9em;color:#444;}
+.section{margin-top:20px;}
+.table-container{max-height:400px;overflow-y:auto;margin-top:10px;}
+.chart-container{position:relative;height:400px;margin-top:20px;background:white;padding:15px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);}
+canvas{width:100%!important;height:100%!important;}
+.grid-layout{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px;}
+@media (max-width: 768px){.grid-layout{grid-template-columns:1fr;}}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Sinc Calculator</h1>
+<div class="controls">
+<label class="small">Terms (10-1000): <input id="terms" type="number" value="20" min="10" max="1000"></label>
+<label class="small">Points (10-300): <input id="points" type="number" value="50" min="10" max="300"></label>
+<button onclick="calculate();">Calculate</button>
+</div>
+<div class="status" id="statusArea"></div>
+
+<div class="section">
+<h2>Times (ms)</h2>
+<table>
+<thead><tr><th>1 Core</th><th>2 Cores</th><th>Difference</th></tr></thead>
+<tbody id="timesTable"><tr><td colspan="3">No data</td></tr></tbody>
+</table>
+</div>
+
+<div class="section">
+<h2>Sinc Function Graph</h2>
+<div class="chart-container">
+<canvas id="sincChart"></canvas>
+</div>
+</div>
+
+<div class="grid-layout">
+<div class="section">
+<h2>Calculated Values</h2>
+<div class="table-container">
+<table>
+<thead><tr><th>x</th><th>y (1 Core)</th><th>y (2 Cores)</th><th>Difference</th></tr></thead>
+<tbody id="valuesTable"><tr><td colspan="4">No data</td></tr></tbody>
+</table>
+</div>
+</div>
+
+<div class="section">
+<h2>Graph Controls</h2>
+<div style="background:white;padding:15px;border-radius:8px;">
+<label style="display:block;margin-bottom:10px;">
+<input type="checkbox" id="show1Core" checked onchange="toggleDataset(0)">
+Show 1 Core Results
+</label>
+<label style="display:block;margin-bottom:10px;">
+<input type="checkbox" id="show2Cores" checked onchange="toggleDataset(1)">
+Show 2 Cores Results
+</label>
+<label style="display:block;margin-bottom:10px;">
+<input type="checkbox" id="showPoints" checked onchange="togglePoints()">
+Show Data Points
+</label>
+<p style="font-size:0.85em;color:#666;margin-top:15px;line-height:1.4;">
+<strong>Note:</strong> The graph shows the complete symmetric sinc(x) function by reflecting the calculated values across the Y-axis.
+</p>
+</div>
+</div>
+</div>
+
+<script>
+let chartData = {data1Core: [], data2Cores: []};
+let chartSettings = {show1Core: true, show2Cores: true, showPoints: true};
+
+function drawChart(){
+    const canvas = document.getElementById('sincChart');
+    if(!canvas) return;
+    
+    const ctx = canvas.getContext('2d');
+    const rect = canvas.parentElement.getBoundingClientRect();
+    
+    // Configurar tamaño del canvas
+    canvas.width = rect.width - 30;
+    canvas.height = rect.height - 30;
+    
+    const width = canvas.width;
+    const height = canvas.height;
+    
+    // Márgenes
+    const margin = {top: 40, right: 30, bottom: 50, left: 70};
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = height - margin.top - margin.bottom;
+    
+    // Limpiar canvas
+    ctx.fillStyle = 'white';
+    ctx.fillRect(0, 0, width, height);
+    
+    if(chartData.data1Core.length === 0 && chartData.data2Cores.length === 0){
+        ctx.fillStyle = '#666';
+        ctx.font = '16px Tahoma';
+        ctx.textAlign = 'center';
+        ctx.fillText('No data available', width/2, height/2);
+        return;
+    }
+    
+    // Encontrar rangos de datos
+    let allData = [];
+    if(chartSettings.show1Core) allData = allData.concat(chartData.data1Core);
+    if(chartSettings.show2Cores) allData = allData.concat(chartData.data2Cores);
+    
+    if(allData.length === 0){
+        ctx.fillStyle = '#666';
+        ctx.font = '16px Tahoma';
+        ctx.textAlign = 'center';
+        ctx.fillText('Select at least one dataset', width/2, height/2);
+        return;
+    }
+    
+    const xMin = Math.min(...allData.map(p => p.x));
+    const xMax = Math.max(...allData.map(p => p.x));
+    const yMin = Math.min(...allData.map(p => p.y));
+    const yMax = Math.max(...allData.map(p => p.y));
+    
+    const xRange = xMax - xMin || 1;
+    const yRange = yMax - yMin || 1;
+    
+    // Función para mapear coordenadas
+    function mapX(x){ return margin.left + ((x - xMin) / xRange) * plotWidth; }
+    function mapY(y){ return margin.top + plotHeight - ((y - yMin) / yRange) * plotHeight; }
+    
+    // Dibujar ejes
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(margin.left, margin.top);
+    ctx.lineTo(margin.left, margin.top + plotHeight);
+    ctx.lineTo(margin.left + plotWidth, margin.top + plotHeight);
+    ctx.stroke();
+    
+    // Etiquetas de ejes
+    ctx.fillStyle = '#000';
+    ctx.font = 'bold 14px Tahoma';
+    ctx.textAlign = 'center';
+    ctx.fillText('x', margin.left + plotWidth/2, height - 10);
+    
+    ctx.save();
+    ctx.translate(15, margin.top + plotHeight/2);
+    ctx.rotate(-Math.PI/2);
+    ctx.fillText('sinc(x)', 0, 0);
+    ctx.restore();
+    
+    // Marcas del eje X
+    ctx.fillStyle = '#666';
+    ctx.font = '11px Tahoma';
+    ctx.textAlign = 'center';
+    for(let i = 0; i <= 5; i++){
+        const x = xMin + (xRange * i / 5);
+        const px = mapX(x);
+        ctx.beginPath();
+        ctx.moveTo(px, margin.top + plotHeight);
+        ctx.lineTo(px, margin.top + plotHeight + 5);
+        ctx.stroke();
+        ctx.fillText(x.toFixed(2), px, margin.top + plotHeight + 20);
+    }
+    
+    // Marcas del eje Y
+    ctx.textAlign = 'right';
+    for(let i = 0; i <= 5; i++){
+        const y = yMin + (yRange * i / 5);
+        const py = mapY(y);
+        ctx.beginPath();
+        ctx.moveTo(margin.left - 5, py);
+        ctx.lineTo(margin.left, py);
+        ctx.stroke();
+        ctx.fillText(y.toExponential(1), margin.left - 10, py + 4);
+    }
+    
+    // Dibujar grid
+    ctx.strokeStyle = '#e0e0e0';
+    ctx.lineWidth = 1;
+    for(let i = 1; i < 5; i++){
+        const y = yMin + (yRange * i / 5);
+        const py = mapY(y);
+        ctx.beginPath();
+        ctx.moveTo(margin.left, py);
+        ctx.lineTo(margin.left + plotWidth, py);
+        ctx.stroke();
+    }
+    
+    // Dibujar datos 1 Core
+    if(chartSettings.show1Core && chartData.data1Core.length > 0){
+        ctx.strokeStyle = 'rgb(75, 192, 192)';
+        ctx.fillStyle = 'rgb(75, 192, 192)';
+        ctx.lineWidth = 2;
+        
+        ctx.beginPath();
+        for(let i = 0; i < chartData.data1Core.length; i++){
+            const p = chartData.data1Core[i];
+            const px = mapX(p.x);
+            const py = mapY(p.y);
+            if(i === 0) ctx.moveTo(px, py);
+            else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+        
+        // Puntos
+        if(chartSettings.showPoints){
+            for(let i = 0; i < chartData.data1Core.length; i++){
+                const p = chartData.data1Core[i];
+                const px = mapX(p.x);
+                const py = mapY(p.y);
+                ctx.beginPath();
+                ctx.arc(px, py, 3, 0, 2 * Math.PI);
+                ctx.fill();
+            }
+        }
+    }
+    
+    // Dibujar datos 2 Cores
+    if(chartSettings.show2Cores && chartData.data2Cores.length > 0){
+        ctx.strokeStyle = 'rgb(255, 99, 132)';
+        ctx.fillStyle = 'rgb(255, 99, 132)';
+        ctx.lineWidth = 2;
+        
+        ctx.beginPath();
+        for(let i = 0; i < chartData.data2Cores.length; i++){
+            const p = chartData.data2Cores[i];
+            const px = mapX(p.x);
+            const py = mapY(p.y);
+            if(i === 0) ctx.moveTo(px, py);
+            else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+        
+        // Puntos
+        if(chartSettings.showPoints){
+            for(let i = 0; i < chartData.data2Cores.length; i++){
+                const p = chartData.data2Cores[i];
+                const px = mapX(p.x);
+                const py = mapY(p.y);
+                ctx.beginPath();
+                ctx.arc(px, py, 3, 0, 2 * Math.PI);
+                ctx.fill();
+            }
+        }
+    }
+    
+    // Leyenda
+    ctx.font = '12px Tahoma';
+    let legendY = margin.top;
+    
+    if(chartSettings.show1Core){
+        ctx.fillStyle = 'rgb(75, 192, 192)';
+        ctx.fillRect(margin.left + 10, legendY, 20, 12);
+        ctx.fillStyle = '#000';
+        ctx.textAlign = 'left';
+        ctx.fillText('1 Core', margin.left + 35, legendY + 10);
+        legendY += 20;
+    }
+    
+    if(chartSettings.show2Cores){
+        ctx.fillStyle = 'rgb(255, 99, 132)';
+        ctx.fillRect(margin.left + 10, legendY, 20, 12);
+        ctx.fillStyle = '#000';
+        ctx.textAlign = 'left';
+        ctx.fillText('2 Cores', margin.left + 35, legendY + 10);
+    }
+}
+
+function toggleDataset(index){
+    if(index === 0) chartSettings.show1Core = !chartSettings.show1Core;
+    else chartSettings.show2Cores = !chartSettings.show2Cores;
+    drawChart();
+}
+
+function togglePoints(){
+    chartSettings.showPoints = document.getElementById('showPoints').checked;
+    drawChart();
+}
+
+function updateChart(data){
+    chartData.data1Core = [];
+    chartData.data2Cores = [];
+    
+    // Crear puntos reflejados (negativos) primero, en orden inverso
+    for(let i = data.length - 1; i >= 0; i--){
+        let point = data[i];
+        if(point.x > 0){ // Solo reflejar puntos positivos
+            chartData.data1Core.push({x: -point.x, y: point.y1});
+            chartData.data2Cores.push({x: -point.x, y: point.y2});
+        }
+    }
+    
+    // Agregar puntos originales
+    for(let i = 0; i < data.length; i++){
+        let point = data[i];
+        chartData.data1Core.push({x: point.x, y: point.y1});
+        chartData.data2Cores.push({x: point.x, y: point.y2});
+    }
+    
+    drawChart();
+}
+
+function parseTimesFromText(text){
+    let lines = text.split("\\n");
+    let t1 = null, t2 = null;
+    for(let ln of lines){
+        ln = ln.trim();
+        if(ln.startsWith("T1:")) {
+            let v = ln.substring(3).trim();
+            if(v) t1 = parseInt(v);
+        } else if(ln.startsWith("T2:")) {
+            let v = ln.substring(3).trim();
+            if(v) t2 = parseInt(v);
+        }
+    }
+    return {t1:t1, t2:t2};
+}
+
+function calculate(){
+    let n = parseInt(document.getElementById("terms").value);
+    let p = parseInt(document.getElementById("points").value);
+    let status = document.getElementById("statusArea");
+    if(isNaN(n) || isNaN(p)) { status.textContent = "Ingresa valores válidos"; return; }
+    if(n < 10 || n > 1000 || p < 10 || p > 300) { status.textContent = "Valores fuera de rango"; return; }
+
+    status.textContent = "Calculando... por favor espere";
+    document.getElementById("timesTable").innerHTML = "<tr><td colspan='3'>Esperando respuesta...</td></tr>";
+    document.getElementById("valuesTable").innerHTML = "<tr><td colspan='4'>Esperando datos...</td></tr>";
+
+    let expectedPoints = p; // Guardamos cuántos puntos esperamos
+
+    let xhr = new XMLHttpRequest();
+    xhr.open("GET", "/sinc?n="+encodeURIComponent(n)+"&p="+encodeURIComponent(p));
+    xhr.timeout = 180000;
+    xhr.onload = function(){
+        if(xhr.status===200){
+            const txt = xhr.responseText;
+            const parsed = parseTimesFromText(txt);
+            
+            // Actualizar tabla de tiempos
+            let tbody = document.getElementById("timesTable");
+            if(parsed.t1 !== null || parsed.t2 !== null){
+                let a = parsed.t1 !== null ? parsed.t1 : "";
+                let b = parsed.t2 !== null ? parsed.t2 : "";
+                let diff = (a !== "" && b !== "") ? Math.abs(a - b) : "";
+                tbody.innerHTML = "<tr><td>"+a+"</td><td>"+b+"</td><td>"+diff+"</td></tr>";
+                status.textContent = "Cálculo terminado - Recibiendo valores...";
+            } else {
+                tbody.innerHTML = "<tr><td colspan='3'>No se recibieron tiempos</td></tr>";
+                status.textContent = "Cálculo terminado (sin tiempos)";
+            }
+            
+            // Esperar un poco más y luego obtener valores con reintentos
+            setTimeout(function(){ fetchValuesWithRetry(expectedPoints, 0); }, 500);
+        } else {
+            status.textContent = "Error: " + xhr.status;
+            document.getElementById("timesTable").innerHTML = "<tr><td colspan='3'>Error</td></tr>";
+        }
+    };
+    xhr.onerror = function(){ status.textContent = "Request error"; };
+    xhr.ontimeout = function(){ status.textContent = "Timeout"; };
+    xhr.send();
+}
+
+function fetchValuesWithRetry(expectedPoints, attempt){
+    let maxAttempts = 15; // Máximo 15 intentos
+    let xhr = new XMLHttpRequest();
+    xhr.open("GET", "/getvalues");
+    xhr.timeout = 5000;
+    xhr.onload = function(){
+        if(xhr.status===200){
+            try {
+                const data = JSON.parse(xhr.responseText);
+                
+                if(data.length >= expectedPoints || attempt >= maxAttempts - 1){
+                    // Tenemos todos los puntos o llegamos al límite de intentos
+                    updateValuesTable(data);
+                    document.getElementById("statusArea").textContent = 
+                        "Completado - " + data.length + " de " + expectedPoints + " puntos recibidos";
+                } else {
+                    // Faltan puntos, reintentar
+                    document.getElementById("statusArea").textContent = 
+                        "Recibiendo valores... " + data.length + "/" + expectedPoints + " puntos";
+                    setTimeout(function(){ fetchValuesWithRetry(expectedPoints, attempt + 1); }, 1000);
+                }
+            } catch(e) {
+                console.error("Error parsing values:", e);
+                document.getElementById("statusArea").textContent = "Error al procesar valores";
+            }
+        } else if(attempt < maxAttempts - 1) {
+            // Reintentar si hubo error
+            setTimeout(function(){ fetchValuesWithRetry(expectedPoints, attempt + 1); }, 1000);
+        }
+    };
+    xhr.onerror = function(){ 
+        if(attempt < maxAttempts - 1) {
+            setTimeout(function(){ fetchValuesWithRetry(expectedPoints, attempt + 1); }, 1000);
+        }
+    };
+    xhr.send();
+}
+
+function updateValuesTable(data){
+    let tbody = document.getElementById("valuesTable");
+    if(data.length === 0){
+        tbody.innerHTML = "<tr><td colspan='4'>No hay datos disponibles</td></tr>";
+        return;
+    }
+    
+    let html = "";
+    for(let i = 0; i < data.length; i++){
+        let point = data[i];
+        let diff = Math.abs(point.y1 - point.y2).toExponential(6);
+        html += "<tr>";
+        html += "<td>" + point.x.toFixed(6) + "</td>";
+        html += "<td>" + point.y1.toExponential(8) + "</td>";
+        html += "<td>" + point.y2.toExponential(8) + "</td>";
+        html += "<td>" + diff + "</td>";
+        html += "</tr>";
+    }
+    tbody.innerHTML = html;
+    
+    // Actualizar gráfico
+    updateChart(data);
+}
+
+// Redibujar gráfico al cambiar tamaño de ventana
+window.addEventListener('resize', drawChart);
+
+// Dibujar gráfico inicial al cargar
+window.onload = function(){
+    drawChart();
+};
+</script>
+</div>
+</body>
+</html>
+"""
+    return html
+
+
+# =============================================
+# Main
+# =============================================
+def main():
+    configurarUART()
+    configurarWiFi()
+    ok = hacer_handshake()
+    if not ok:
+        raise Exception("No se pudo comunicar con RP2040 (sin PONG)")
+    _thread.start_new_thread(hilo_lector_uart, (None,))
+    configurarSockets()
+    print("Sistema listo. Esperando conexiones HTTP...")
+    while True:
+        atender_web()
+
+if __name__ == "__main__":
+    main()
